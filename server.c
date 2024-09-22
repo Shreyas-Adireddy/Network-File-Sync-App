@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <openssl/sha.h>
+#include <asm-generic/socket.h>
 
 #define MAX_CLIENTS 10
 #define BUFFER_SIZE 1024
@@ -151,7 +152,7 @@ void handle_diff(int client_socket, const char *client_files) {
     // Implement file difference logic here
     printf("Handling DIFF request\n");
     // For now, just send a dummy response
-    Message response = {DIFF, 18, "File3\nFile4\nFile5\n"};
+    Message response = {DIFF, 18, "File3, File4, File5\n"};
     send(client_socket, &response, sizeof(Message), 0);
 }
 
