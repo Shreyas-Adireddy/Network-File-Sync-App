@@ -8,10 +8,11 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <openssl/sha.h>
-#include <asm-generic/socket.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/sendfile.h>
 
 #define MAX_CLIENTS 10
-#define BUFFER_SIZE 1024
 #define MAX_DATA_SIZE 4096
 
 typedef enum {
@@ -34,7 +35,7 @@ typedef struct {
 
 void *handle_client(void *arg);
 void handle_list(int client_socket);
-void handle_diff(int client_socket, const char *client_files);
+void handle_diff(int client_socket, char *client_files);
 void handle_pull(int client_socket, const char *filename);
 void handle_leave(int client_socket);
 
@@ -106,7 +107,6 @@ int main() {
 void *handle_client(void *arg) {
     client_t *client = (client_t*)arg;
     int client_socket = client->socket;
-    char buffer[BUFFER_SIZE] = {0};
     Message msg;
 
     printf("New client connected: %s:%d\n", inet_ntoa(client->address.sin_addr), ntohs(client->address.sin_port));
@@ -141,27 +141,164 @@ void *handle_client(void *arg) {
 }
 
 void handle_list(int client_socket) {
-    // Implement directory listing logic here
-    printf("Handling LIST request\n");
-    // For now, just send a dummy response
-    Message response = {LIST, 13, "File1, File2\n"};
-    send(client_socket, &response, sizeof(Message), 0);
+    DIR *dir;
+    struct dirent *ent;
+    Message file_descriptor;
+
+    // Send file contents
+    dir = opendir(".");
+    if (dir == NULL) {
+        perror("Unable to open directory");
+        return;
+    }
+
+    while ((ent = readdir(dir)) != NULL) {
+        if (ent->d_type == DT_REG) {  // Regular file
+            int fd = open(ent->d_name, O_RDONLY);
+            if (fd == -1) {
+                printf("Unable to open file %s\n", ent->d_name);
+                continue;
+            }
+
+            struct stat st;
+            if (fstat(fd, &st) == -1){
+                perror("fstat failed");
+                close(fd);
+                continue;
+            }
+            // Send name and file size first
+            memset(&file_descriptor, 0, sizeof(file_descriptor));
+
+            const char *file_name = ent->d_name;
+            size_t name_length = strlen(file_name);
+            memcpy(&file_descriptor.data, file_name, name_length);
+            file_descriptor.data_length = st.st_size;
+            send(client_socket, &file_descriptor, sizeof(file_descriptor), 0);
+
+            printf("File sending - %s - with size %zu\n", file_descriptor.data, file_descriptor.data_length);
+            // Use sendfile to send file contents
+            ssize_t sent_bytes = sendfile(client_socket, fd, NULL, st.st_size);
+            if (sent_bytes == -1) {
+                perror("sendfile");
+            } else {
+                printf("Sent %zd bytes for file %s\n", sent_bytes, ent->d_name);
+            }
+
+            close(fd);
+        }
+    }
+
+    closedir(dir);
+
+    // Send end of transmission marker
+    memset(&file_descriptor, 0, sizeof(file_descriptor));
+    send(client_socket, &file_descriptor, sizeof(file_descriptor), 0);
+
+    printf("LIST for client concluded\n");
 }
 
-void handle_diff(int client_socket, const char *client_files) {
-    // Implement file difference logic here
-    printf("Handling DIFF request\n");
-    // For now, just send a dummy response
-    Message response = {DIFF, 18, "File3, File4, File5\n"};
-    send(client_socket, &response, sizeof(Message), 0);
+void handle_diff(int client_socket, char *client_files) {
+    DIR *dir;
+    struct dirent *ent;
+    char server_files[MAX_DATA_SIZE] = {0};
+    char missing_files[MAX_DATA_SIZE] = {0};
+    int server_file_count = 0;
+    int missing_file_count = 0;
+    
+    // Get list of files on the server
+    dir = opendir(".");
+    if (dir == NULL) {
+        perror("Unable to open directory");
+        return;
+    }
+
+    while ((ent = readdir(dir)) != NULL) {
+        if (ent->d_type == DT_REG) {  // Regular file
+            strcat(server_files, ent->d_name);
+            strcat(server_files, "|");
+            server_file_count++;
+        }
+    }
+    closedir(dir);
+
+    // Compare server files with client files
+    char *token = strtok(server_files, "|");
+    while (token != NULL) {
+        if (strstr(client_files, token) == NULL) {
+            // File not found on server, add to missing files
+            strcat(missing_files, token);
+            strcat(missing_files, "|");
+            missing_file_count++;
+        }
+        token = strtok(NULL, "|");
+    }
+
+    // Prepare and send response
+    Message response;
+    memcpy(&response.data, missing_files, MAX_DATA_SIZE);
+    response.data_length = missing_file_count;
+    response.type = DIFF;
+    printf("Difference files: %s\n", response.data);
+    send(client_socket, &response, sizeof(response), 0);
+
+    printf("Sent difference information to client.\n");
 }
 
-void handle_pull(int client_socket, const char *filename) {
-    // Implement file sending logic here
-    printf("Handling PULL request for file: %s\n", filename);
-    // For now, just send a dummy response
-    Message response = {PULL, 14, "File contents"};
-    send(client_socket, &response, sizeof(Message), 0);
+void handle_pull(int client_socket, const char *filenames) {
+    DIR *dir;
+    struct dirent *ent;
+    Message file_descriptor;
+
+    // Send file contents
+    dir = opendir(".");
+    if (dir == NULL) {
+        perror("Unable to open directory");
+        return;
+    }
+
+    while ((ent = readdir(dir)) != NULL) {
+        if (ent->d_type == DT_REG && strstr(filenames, ent->d_name) != NULL) {  // Regular file
+            int fd = open(ent->d_name, O_RDONLY);
+            if (fd == -1) {
+                printf("Unable to open file %s\n", ent->d_name);
+                continue;
+            }
+
+            struct stat st;
+            if (fstat(fd, &st) == -1){
+                perror("fstat failed");
+                close(fd);
+                continue;
+            }
+            // Send name and file size first
+            memset(&file_descriptor, 0, sizeof(file_descriptor));
+
+            const char *file_name = ent->d_name;
+            size_t name_length = strlen(file_name);
+            memcpy(&file_descriptor.data, file_name, name_length);
+            file_descriptor.data_length = st.st_size;
+            send(client_socket, &file_descriptor, sizeof(file_descriptor), 0);
+
+            printf("File sending - %s - with size %zu\n", file_descriptor.data, file_descriptor.data_length);
+
+            ssize_t sent_bytes = sendfile(client_socket, fd, NULL, st.st_size);
+            if (sent_bytes == -1) {
+                perror("sendfile");
+            } else {
+                printf("Sent %zd bytes for file %s\n", sent_bytes, ent->d_name);
+            }
+
+            close(fd);
+        }
+    }
+
+    closedir(dir);
+
+    // Send end of transmission marker
+    memset(&file_descriptor, 0, sizeof(file_descriptor));
+    send(client_socket, &file_descriptor, sizeof(file_descriptor), 0);
+
+    printf("PULL for client concluded\n");
 }
 
 void handle_leave(int client_socket) {
