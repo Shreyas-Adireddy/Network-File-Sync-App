@@ -7,10 +7,11 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <openssl/sha.h>
 
 #define BUFFER_SIZE 1024
 #define MAX_DATA_SIZE 4096
-#define MAX_FILES 512
+#define MAX_FILES 32
 
 typedef enum {
     LIST,
@@ -25,6 +26,11 @@ typedef struct {
     char data[MAX_DATA_SIZE];
 } Message;
 
+typedef struct {
+    char filename[256];
+    char hash[SHA256_DIGEST_LENGTH * 2 + 1];
+} FileInfo;
+
 int sock = 0;
 
 void send_message(MessageType type);
@@ -32,7 +38,8 @@ void send_message_pull(Message* diff);
 void handle_user_input();
 void receive_and_save_files();
 void receive_and_save_diff(Message* diff);
-int crawl_directory(char* data);
+int crawl_directory(FileInfo *files);
+void calculate_file_hash(const char *filename, char *hash);
 
 int main() {
     struct sockaddr_in serv_addr;
@@ -67,13 +74,15 @@ void send_message(MessageType type) {
     Message msg;
     msg.type = type;
     msg.data_length = 0;
-    if (type == DIFF){
-        int num_files = 0;
-        if ((num_files = crawl_directory(msg.data)) < 0){
+    if (type == DIFF) {
+        FileInfo files[MAX_FILES];
+        int num_files = crawl_directory(files);
+        if (num_files < 0) {
             perror("DIFF failed to crawl dir");
             return;
         }
-        msg.data_length = num_files;
+        msg.data_length = num_files * sizeof(FileInfo);
+        memcpy(msg.data, files, msg.data_length);
     }
     send(sock, &msg, sizeof(Message), 0);
 }
@@ -151,7 +160,7 @@ void receive_and_save_files(){
     printf("All files received.\n");
 }
 
-int crawl_directory(char* data){
+int crawl_directory(FileInfo *files) {
     DIR *dir;
     struct dirent *ent;
 
@@ -161,33 +170,55 @@ int crawl_directory(char* data){
         return -1;
     }
 
-    int index = 0, file_count = 0;
-    while ((ent = readdir(dir)) != NULL) {
+    int file_count = 0;
+    while ((ent = readdir(dir)) != NULL && file_count < MAX_FILES) {
         if (ent->d_type == DT_REG) {  // Regular file
-            // Add name and file size
-            const char *file_name = ent->d_name;
-            size_t name_length = strlen(file_name);
-
-            if (name_length + index + 1 >= MAX_DATA_SIZE){
-                perror("buffer exceeded too many files");
-                return -1;
-            }
-            
-            memcpy(&data[index], file_name, name_length);
-            index += name_length;
-            
-            // Add delimiter |
-            data[index] = '|';
-            index++;
+            strncpy(files[file_count].filename, ent->d_name, sizeof(files[file_count].filename) - 1);
+            calculate_file_hash(ent->d_name, files[file_count].hash);
             file_count++;
         }
     }
+    closedir(dir);
     return file_count;
 }
 
-void receive_and_save_diff(Message* diff){
-    if (recv(sock, diff, sizeof(Message), 0) < 0){
+void receive_and_save_diff(Message* diff) {
+    if (recv(sock, diff, sizeof(Message), 0) < 0) {
         perror("recv");
         return;
     }
+    
+    FileInfo *missing_files = (FileInfo *)diff->data;
+    int num_missing = diff->data_length / sizeof(FileInfo);
+    
+    printf("Missing or different files:\n");
+    for (int i = 0; i < num_missing; i++) {
+        printf("%s\n", missing_files[i].filename);
+    }
+}
+
+void calculate_file_hash(const char *filename, char *hash) {
+    FILE *file = fopen(filename, "rb");
+    if (!file) {
+        perror("Failed to open file");
+        return;
+    }
+
+    SHA256_CTX sha256;
+    SHA256_Init(&sha256);
+    unsigned char buffer[BUFFER_SIZE];
+    int bytesRead = 0;
+
+    while ((bytesRead = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
+        SHA256_Update(&sha256, buffer, bytesRead);
+    }
+
+    unsigned char hash_result[SHA256_DIGEST_LENGTH];
+    SHA256_Final(hash_result, &sha256);
+
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        sprintf(&hash[i * 2], "%02x", hash_result[i]);
+    }
+
+    fclose(file);
 }

@@ -14,6 +14,7 @@
 
 #define MAX_CLIENTS 10
 #define MAX_DATA_SIZE 4096
+#define MAX_FILES 32
 
 typedef enum {
     LIST,
@@ -33,11 +34,17 @@ typedef struct {
     struct sockaddr_in address;
 } client_t;
 
+typedef struct {
+    char filename[256];
+    char hash[SHA256_DIGEST_LENGTH * 2 + 1];
+} FileInfo;
+
 void *handle_client(void *arg);
 void handle_list(int client_socket);
 void handle_diff(int client_socket, char *client_files);
 void handle_pull(int client_socket, const char *filename);
 void handle_leave(int client_socket);
+void calculate_file_hash(const char *filename, char *hash);
 
 int main() {
     int server_fd, new_socket;
@@ -60,7 +67,7 @@ int main() {
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(8080);
+    address.sin_port = htons(9090);
 
     // Bind the socket to the network address and port
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
@@ -197,48 +204,59 @@ void handle_list(int client_socket) {
     printf("LIST for client concluded\n");
 }
 
-void handle_diff(int client_socket, char *client_files) {
+void handle_diff(int client_socket, char *client_data) {
     DIR *dir;
     struct dirent *ent;
-    char server_files[MAX_DATA_SIZE] = {0};
-    char missing_files[MAX_DATA_SIZE] = {0};
+    FileInfo server_files[MAX_FILES];
+    FileInfo missing_files[MAX_FILES];
     int server_file_count = 0;
     int missing_file_count = 0;
     
-    // Get list of files on the server
+    // Get list of files on the server with their hashes
     dir = opendir(".");
     if (dir == NULL) {
         perror("Unable to open directory");
         return;
     }
 
-    while ((ent = readdir(dir)) != NULL) {
+    while ((ent = readdir(dir)) != NULL && server_file_count < MAX_FILES) {
         if (ent->d_type == DT_REG) {  // Regular file
-            strcat(server_files, ent->d_name);
-            strcat(server_files, "|");
+            strncpy(server_files[server_file_count].filename, ent->d_name, sizeof(server_files[server_file_count].filename) - 1);
+            calculate_file_hash(ent->d_name, server_files[server_file_count].hash);
             server_file_count++;
         }
     }
     closedir(dir);
 
     // Compare server files with client files
-    char *token = strtok(server_files, "|");
-    while (token != NULL) {
-        if (strstr(client_files, token) == NULL) {
-            // File not found on server, add to missing files
-            strcat(missing_files, token);
-            strcat(missing_files, "|");
+    FileInfo *client_files = (FileInfo *)client_data;
+    int client_file_count = ((Message *)client_data)->data_length / sizeof(FileInfo);
+
+    for (int i = 0; i < server_file_count; i++) {
+        int found = 0;
+        for (int j = 0; j < client_file_count; j++) {
+            if (strcmp(server_files[i].filename, client_files[j].filename) == 0) {
+                found = 1;
+                if (strcmp(server_files[i].hash, client_files[j].hash) != 0) {
+                    // File exists but has different hash
+                    memcpy(&missing_files[missing_file_count], &server_files[i], sizeof(FileInfo));
+                    missing_file_count++;
+                }
+                break;
+            }
+        }
+        if (!found) {
+            // File doesn't exist on client
+            memcpy(&missing_files[missing_file_count], &server_files[i], sizeof(FileInfo));
             missing_file_count++;
         }
-        token = strtok(NULL, "|");
     }
 
     // Prepare and send response
     Message response;
-    memcpy(&response.data, missing_files, MAX_DATA_SIZE);
-    response.data_length = missing_file_count;
+    memcpy(response.data, missing_files, missing_file_count * sizeof(FileInfo));
+    response.data_length = missing_file_count * sizeof(FileInfo);
     response.type = DIFF;
-    printf("Difference files: %s\n", response.data);
     send(client_socket, &response, sizeof(response), 0);
 
     printf("Sent difference information to client.\n");
@@ -305,4 +323,30 @@ void handle_leave(int client_socket) {
     printf("Handling LEAVE request\n");
     Message response = {LEAVE, 7, "Goodbye"};
     send(client_socket, &response, sizeof(Message), 0);
+}
+
+void calculate_file_hash(const char *filename, char *hash) {
+    FILE *file = fopen(filename, "rb");
+    if (!file) {
+        perror("Failed to open file");
+        return;
+    }
+
+    SHA256_CTX sha256;
+    SHA256_Init(&sha256);
+    unsigned char buffer[1024];
+    int bytesRead = 0;
+
+    while ((bytesRead = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        SHA256_Update(&sha256, buffer, bytesRead);
+    }
+
+    unsigned char hash_result[SHA256_DIGEST_LENGTH];
+    SHA256_Final(hash_result, &sha256);
+
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        sprintf(&hash[i * 2], "%02x", hash_result[i]);
+    }
+
+    fclose(file);
 }
