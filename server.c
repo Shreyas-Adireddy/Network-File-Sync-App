@@ -67,7 +67,7 @@ int main() {
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(9090);
+    address.sin_port = htons(8080);
 
     // Bind the socket to the network address and port
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
